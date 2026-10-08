@@ -1,0 +1,28 @@
+# PowerShell session history
+ConsoleHost_history.txt
+
+# Azure CLI and local environment configuration
+.azure/
+.env
+.env.*
+
+# Local credentials and certificates
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
