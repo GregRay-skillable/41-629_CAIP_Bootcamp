@@ -1249,8 +1249,162 @@ param suffix string
     Complete-DiagnosticStep
 
     Start-DiagnosticStep `
-        -Number 15 `
-        -Name 'Deploy Azure subscription template'
+    -Number 15 `
+    -Name 'Validate and deploy Azure subscription template'
+
+# =====================================================================
+# PRE-VALIDATE TEMPLATE
+#
+# InvalidTemplateDeployment can occur before Azure creates a deployment
+# record. Explicit validation gives us the detailed ARM validation error
+# before New-AzSubscriptionDeployment is attempted.
+# =====================================================================
+
+Write-Host "Validating subscription deployment '$deploymentName'..."
+
+try {
+
+    $validationResult = Test-AzSubscriptionDeployment `
+        -Location $primaryLocation `
+        -TemplateFile $templateFile `
+        -TemplateParameterObject $templateParameters `
+        -ErrorAction Stop
+
+    if ($null -ne $validationResult) {
+
+        Write-Host 'ARM validation returned:'
+
+        $validationResult |
+            ConvertTo-Json -Depth 50 |
+            Write-Host
+
+        $validationText = $validationResult |
+            ConvertTo-Json -Depth 50 -Compress
+
+        throw (
+            "ARM TEMPLATE VALIDATION FAILED for '$deploymentName'. " +
+            "ValidationResult=$validationText"
+        )
+    }
+
+    Write-Host 'ARM template validation succeeded.'
+}
+catch {
+
+    $validationError = $_
+
+    $details = New-Object System.Collections.Generic.List[string]
+
+    $details.Add(
+        "ARM TEMPLATE VALIDATION FAILED for '$deploymentName'"
+    )
+
+    $details.Add(
+        "Exception=$($validationError.Exception.Message)"
+    )
+
+    if (
+        $null -ne $validationError.ErrorDetails -and
+        -not [string]::IsNullOrWhiteSpace(
+            [string]$validationError.ErrorDetails.Message
+        )
+    ) {
+        $details.Add(
+            "ErrorDetails=$($validationError.ErrorDetails.Message)"
+        )
+    }
+
+    if ($null -ne $validationError.Exception.InnerException) {
+        $details.Add(
+            "InnerException=$($validationError.Exception.InnerException.Message)"
+        )
+    }
+
+    $details.Add(
+        "FullyQualifiedErrorId=$($validationError.FullyQualifiedErrorId)"
+    )
+
+    $details.Add(
+        "Category=$($validationError.CategoryInfo)"
+    )
+
+    throw ($details -join ' | ')
+}
+
+# =====================================================================
+# CHECK FOR EXISTING DEPLOYMENT
+# =====================================================================
+
+$deployment = Get-AzSubscriptionDeployment `
+    -Name $deploymentName `
+    -ErrorAction SilentlyContinue
+
+if (
+    $null -ne $deployment -and
+    $deployment.ProvisioningState -in @(
+        'Accepted',
+        'Running'
+    )
+) {
+
+    Write-Host (
+        "Deployment '$deploymentName' is already active with state " +
+        "'$($deployment.ProvisioningState)'. Waiting for completion..."
+    )
+
+    $maxAttempts = 240
+    $delaySeconds = 30
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+
+        Start-Sleep -Seconds $delaySeconds
+
+        $deployment = Get-AzSubscriptionDeployment `
+            -Name $deploymentName `
+            -ErrorAction Stop
+
+        Write-Host (
+            "Existing deployment state: " +
+            "$($deployment.ProvisioningState) " +
+            "(check $attempt of $maxAttempts)"
+        )
+
+        if ($deployment.ProvisioningState -eq 'Succeeded') {
+            break
+        }
+
+        if (
+            $deployment.ProvisioningState -in @(
+                'Failed',
+                'Canceled'
+            )
+        ) {
+            throw (
+                "Existing deployment '$deploymentName' completed with " +
+                "state '$($deployment.ProvisioningState)'."
+            )
+        }
+    }
+
+    if ($deployment.ProvisioningState -ne 'Succeeded') {
+        throw (
+            "Existing deployment '$deploymentName' did not complete " +
+            "within $($maxAttempts * $delaySeconds) seconds. " +
+            "Last state='$($deployment.ProvisioningState)'."
+        )
+    }
+}
+elseif (
+    $null -ne $deployment -and
+    $deployment.ProvisioningState -eq 'Succeeded'
+) {
+
+    Write-Host (
+        "Deployment '$deploymentName' already succeeded. " +
+        "Reusing existing deployment."
+    )
+}
+else {
 
     # =================================================================
     # DEPLOY
@@ -1264,35 +1418,35 @@ param suffix string
         -TemplateFile $templateFile `
         -TemplateParameterObject $templateParameters `
         -ErrorAction Stop
+}
 
-    if ($null -eq $deployment) {
-        throw 'Azure subscription deployment returned no result.'
-    }
+if ($null -eq $deployment) {
+    throw 'Azure subscription deployment returned no result.'
+}
 
-    if ($deployment.ProvisioningState -ne 'Succeeded') {
+if ($deployment.ProvisioningState -ne 'Succeeded') {
+    throw (
+        "Deployment '$deploymentName' completed with state " +
+        "'$($deployment.ProvisioningState)'."
+    )
+}
 
-        throw (
-            "Deployment '$deploymentName' completed with state " +
-            "'$($deployment.ProvisioningState)'."
-        )
-    }
+Write-Host ''
+Write-Host '============================================================'
+Write-Host 'DAY 2 DEPLOYMENT SUCCEEDED'
+Write-Host '============================================================'
+Write-Host "Lab Instance ID : $environmentName"
+Write-Host "Resource suffix : $skillableSuffix"
+Write-Host "Deployment      : $deploymentName"
+Write-Host '============================================================'
 
-    Write-Host ''
-    Write-Host '============================================================'
-    Write-Host 'DAY 2 DEPLOYMENT SUCCEEDED'
-    Write-Host '============================================================'
-    Write-Host "Lab Instance ID : $environmentName"
-    Write-Host "Resource suffix : $skillableSuffix"
-    Write-Host "Deployment      : $deploymentName"
-    Write-Host '============================================================'
+$deployment |
+    ConvertTo-Json -Depth 30 |
+    Set-Content `
+        -LiteralPath $deploymentResultPath `
+        -Encoding UTF8
 
-    $deployment |
-        ConvertTo-Json -Depth 30 |
-        Set-Content `
-            -LiteralPath $deploymentResultPath `
-            -Encoding UTF8
-
-    Complete-DiagnosticStep
+Complete-DiagnosticStep
 
     Write-Host ''
     Write-Host '================ DIAGNOSTIC STEP SUMMARY ================'
