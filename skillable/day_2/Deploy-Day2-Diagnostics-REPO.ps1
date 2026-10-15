@@ -1146,95 +1146,20 @@ param suffix string
 
     Start-DiagnosticStep `
         -Number 14 `
-        -Name 'Capture provider and pre-deployment state'
+        -Name 'Check existing deployment state'
 
-    $requiredProviders = @(
-        'Microsoft.Authorization'
-        'Microsoft.Compute'
-        'Microsoft.Network'
-        'Microsoft.Sql'
-        'Microsoft.Storage'
-        'Microsoft.DataMigration'
-        'Microsoft.ContainerRegistry'
-        'Microsoft.App'
-        'Microsoft.OperationalInsights'
-        'Microsoft.Cdn'
-        'Microsoft.KeyVault'
-        'Microsoft.ManagedIdentity'
-    )
-
-    $providerSnapshot = @(
-        foreach ($providerNamespace in $requiredProviders) {
-            try {
-                $providerRecords = @(
-                    Get-AzResourceProvider `
-                        -ProviderNamespace $providerNamespace `
-                        -ErrorAction Stop `
-                        -WarningAction SilentlyContinue
-                )
-
-                $states = @(
-                    $providerRecords |
-                        Select-Object `
-                            -ExpandProperty RegistrationState `
-                            -Unique
-                )
-
-                [pscustomobject]@{
-                    Namespace = $providerNamespace
-                    States    = $states
-                    Error     = $null
-                }
-            }
-            catch {
-                [pscustomobject]@{
-                    Namespace = $providerNamespace
-                    States    = @()
-                    Error     = $_.Exception.Message
-                }
-            }
-        }
-    )
-
-    $providerSnapshot |
-        ConvertTo-Json -Depth 10 |
-        Set-Content `
-            -LiteralPath $providerSnapshotPath `
-            -Encoding UTF8
-
-    foreach ($provider in $providerSnapshot) {
-        $providerDescription = if (
-            -not [string]::IsNullOrWhiteSpace([string]$provider.Error)
-        ) {
-            "ERROR: $($provider.Error)"
-        }
-        else {
-            $provider.States -join ', '
-        }
-
-        Write-Host (
-            "Provider {0}: {1}" -f `
-                $provider.Namespace, `
-                $providerDescription
-        )
-    }
-
+    # Keep the pre-deployment path intentionally fast. The earlier provider
+    # sweep added more than a minute before ARM deployment and changed the
+    # lifecycle timing. Provider and policy diagnostics are collected only
+    # after an actual deployment failure.
     $existingDeployment = Get-AzSubscriptionDeployment `
         -Name $deploymentName `
         -ErrorAction SilentlyContinue
 
-    $matchingResourceGroups = @(
-        Get-AzResourceGroup -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.ResourceGroupName -like "*$environmentName*"
-            }
-    )
-
     $preDeploymentSnapshot = [ordered]@{
-        Timestamp              = Get-Date -Format o
-        DeploymentName         = $deploymentName
-        ExistingDeployment     = $existingDeployment
-        MatchingResourceGroups = $matchingResourceGroups
+        Timestamp          = Get-Date -Format o
+        DeploymentName     = $deploymentName
+        ExistingDeployment = $existingDeployment
     }
 
     $preDeploymentSnapshot |
@@ -1244,209 +1169,240 @@ param suffix string
             -Encoding UTF8
 
     Write-Host "Existing deployment found: $($null -ne $existingDeployment)"
-    Write-Host "Matching resource groups: $($matchingResourceGroups.Count)"
+
+    if ($null -ne $existingDeployment) {
+        Write-Host (
+            "Existing deployment state: " +
+            "$($existingDeployment.ProvisioningState)"
+        )
+    }
 
     Complete-DiagnosticStep
 
     Start-DiagnosticStep `
-    -Number 15 `
-    -Name 'Validate and deploy Azure subscription template'
+        -Number 15 `
+        -Name 'Deploy Azure subscription template'
 
-# =====================================================================
-# PRE-VALIDATE TEMPLATE
-#
-# InvalidTemplateDeployment can occur before Azure creates a deployment
-# record. Explicit validation gives us the detailed ARM validation error
-# before New-AzSubscriptionDeployment is attempted.
-# =====================================================================
+    # =================================================================
+    # DEPLOY IMMEDIATELY
+    #
+    # Do not run a provider sweep or template validation before the normal
+    # deployment call. Those diagnostics materially changed the lifecycle
+    # timing. Validation is performed only after a non-transient failure.
+    # =================================================================
 
-Write-Host "Validating subscription deployment '$deploymentName'..."
-
-try {
-
-    $validationResult = Test-AzSubscriptionDeployment `
-        -Location $primaryLocation `
-        -TemplateFile $templateFile `
-        -TemplateParameterObject $templateParameters `
-        -ErrorAction Stop
-
-    if ($null -ne $validationResult) {
-
-        Write-Host 'ARM validation returned:'
-
-        $validationResult |
-            ConvertTo-Json -Depth 50 |
-            Write-Host
-
-        $validationText = $validationResult |
-            ConvertTo-Json -Depth 50 -Compress
-
-        throw (
-            "ARM TEMPLATE VALIDATION FAILED for '$deploymentName'. " +
-            "ValidationResult=$validationText"
-        )
-    }
-
-    Write-Host 'ARM template validation succeeded.'
-}
-catch {
-
-    $validationError = $_
-
-    $details = New-Object System.Collections.Generic.List[string]
-
-    $details.Add(
-        "ARM TEMPLATE VALIDATION FAILED for '$deploymentName'"
-    )
-
-    $details.Add(
-        "Exception=$($validationError.Exception.Message)"
-    )
+    $deployment = $existingDeployment
 
     if (
-        $null -ne $validationError.ErrorDetails -and
-        -not [string]::IsNullOrWhiteSpace(
-            [string]$validationError.ErrorDetails.Message
+        $null -eq $deployment -or
+        $deployment.ProvisioningState -in @('Failed', 'Canceled')
+    ) {
+        $deployment = $null
+        $deployDelays = @(15, 30, 60)
+        $maximumDeployAttempts = 3
+
+        for (
+            $deployAttempt = 1;
+            $deployAttempt -le $maximumDeployAttempts;
+            $deployAttempt++
+        ) {
+            try {
+                Write-Host (
+                    "Starting subscription deployment '$deploymentName' " +
+                    "(attempt $deployAttempt of $maximumDeployAttempts)..."
+                )
+
+                $deployment = New-AzSubscriptionDeployment `
+                    -Name $deploymentName `
+                    -Location $primaryLocation `
+                    -TemplateFile $templateFile `
+                    -TemplateParameterObject $templateParameters `
+                    -ErrorAction Stop
+
+                break
+            }
+            catch {
+                $deploymentError = $_
+                $combinedError = $deploymentError.Exception.Message
+
+                if ($null -ne $deploymentError.Exception.InnerException) {
+                    $combinedError += (
+                        ' ' +
+                        $deploymentError.Exception.InnerException.Message
+                    )
+                }
+
+                $isTransientTransportFailure = (
+                    $combinedError -match 'Connection reset by peer' -or
+                    $combinedError -match 'An error occurred while sending the request' -or
+                    $combinedError -match 'transport connection' -or
+                    $combinedError -match 'The operation has timed out' -or
+                    $combinedError -match 'request was canceled' -or
+                    $combinedError -match 'temporarily unavailable'
+                )
+
+                if ($isTransientTransportFailure) {
+                    # The service may have accepted the deployment before the
+                    # client connection reset. Check before submitting again.
+                    $deployment = Get-AzSubscriptionDeployment `
+                        -Name $deploymentName `
+                        -ErrorAction SilentlyContinue
+
+                    if ($null -ne $deployment) {
+                        Write-Host (
+                            "Deployment '$deploymentName' exists after the " +
+                            "transport failure with state " +
+                            "'$($deployment.ProvisioningState)'."
+                        )
+                        break
+                    }
+
+                    if ($deployAttempt -lt $maximumDeployAttempts) {
+                        $delaySeconds = $deployDelays[$deployAttempt - 1]
+
+                        Write-Host (
+                            "Transient deployment transport failure: " +
+                            "$combinedError"
+                        )
+                        Write-Host (
+                            "Retrying in $delaySeconds seconds..."
+                        )
+
+                        Start-Sleep -Seconds $delaySeconds
+                        continue
+                    }
+
+                    throw
+                }
+
+                # Preserve fast production timing. Only after the real
+                # deployment call fails do we run explicit validation to
+                # surface policy, quota, naming, or template details.
+                try {
+                    $validationResult = Test-AzSubscriptionDeployment `
+                        -Location $primaryLocation `
+                        -TemplateFile $templateFile `
+                        -TemplateParameterObject $templateParameters `
+                        -ErrorAction Stop
+
+                    if ($null -ne $validationResult) {
+                        $validationText = $validationResult |
+                            ConvertTo-Json -Depth 50 -Compress
+
+                        throw (
+                            "ARM TEMPLATE VALIDATION FAILED for " +
+                            "'$deploymentName'. " +
+                            "ValidationResult=$validationText"
+                        )
+                    }
+                }
+                catch {
+                    if (
+                        $_.Exception.Message -like
+                        'ARM TEMPLATE VALIDATION FAILED*'
+                    ) {
+                        throw
+                    }
+
+                    $validationDetails = $_.Exception.Message
+
+                    if (
+                        $null -ne $_.ErrorDetails -and
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$_.ErrorDetails.Message
+                        )
+                    ) {
+                        $validationDetails += (
+                            ' | ErrorDetails=' +
+                            $_.ErrorDetails.Message
+                        )
+                    }
+
+                    throw (
+                        "Deployment '$deploymentName' failed. " +
+                        "OriginalError=$combinedError | " +
+                        "ValidationError=$validationDetails"
+                    )
+                }
+
+                throw $deploymentError
+            }
+        }
+    }
+
+    if ($null -eq $deployment) {
+        throw 'Azure subscription deployment returned no result.'
+    }
+
+    if (
+        $deployment.ProvisioningState -notin @(
+            'Succeeded',
+            'Failed',
+            'Canceled'
         )
     ) {
-        $details.Add(
-            "ErrorDetails=$($validationError.ErrorDetails.Message)"
-        )
-    }
-
-    if ($null -ne $validationError.Exception.InnerException) {
-        $details.Add(
-            "InnerException=$($validationError.Exception.InnerException.Message)"
-        )
-    }
-
-    $details.Add(
-        "FullyQualifiedErrorId=$($validationError.FullyQualifiedErrorId)"
-    )
-
-    $details.Add(
-        "Category=$($validationError.CategoryInfo)"
-    )
-
-    throw ($details -join ' | ')
-}
-
-# =====================================================================
-# CHECK FOR EXISTING DEPLOYMENT
-# =====================================================================
-
-$deployment = Get-AzSubscriptionDeployment `
-    -Name $deploymentName `
-    -ErrorAction SilentlyContinue
-
-if (
-    $null -ne $deployment -and
-    $deployment.ProvisioningState -in @(
-        'Accepted',
-        'Running'
-    )
-) {
-
-    Write-Host (
-        "Deployment '$deploymentName' is already active with state " +
-        "'$($deployment.ProvisioningState)'. Waiting for completion..."
-    )
-
-    $maxAttempts = 240
-    $delaySeconds = 30
-
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-
-        Start-Sleep -Seconds $delaySeconds
-
-        $deployment = Get-AzSubscriptionDeployment `
-            -Name $deploymentName `
-            -ErrorAction Stop
-
         Write-Host (
-            "Existing deployment state: " +
-            "$($deployment.ProvisioningState) " +
-            "(check $attempt of $maxAttempts)"
+            "Deployment '$deploymentName' is already active with state " +
+            "'$($deployment.ProvisioningState)'. Waiting for completion..."
         )
 
-        if ($deployment.ProvisioningState -eq 'Succeeded') {
-            break
-        }
+        for ($attempt = 1; $attempt -le 240; $attempt++) {
+            Start-Sleep -Seconds 30
 
-        if (
-            $deployment.ProvisioningState -in @(
-                'Failed',
-                'Canceled'
+            $deployment = Get-AzSubscriptionDeployment `
+                -Name $deploymentName `
+                -ErrorAction Stop
+
+            Write-Host (
+                "Existing deployment state: " +
+                "$($deployment.ProvisioningState) " +
+                "(check $attempt of 240)"
             )
-        ) {
-            throw (
-                "Existing deployment '$deploymentName' completed with " +
-                "state '$($deployment.ProvisioningState)'."
-            )
+
+            if ($deployment.ProvisioningState -eq 'Succeeded') {
+                break
+            }
+
+            if (
+                $deployment.ProvisioningState -in @(
+                    'Failed',
+                    'Canceled'
+                )
+            ) {
+                break
+            }
         }
+    }
+    elseif ($deployment.ProvisioningState -eq 'Succeeded') {
+        Write-Host (
+            "Deployment '$deploymentName' already succeeded. " +
+            'Using the existing result.'
+        )
     }
 
     if ($deployment.ProvisioningState -ne 'Succeeded') {
         throw (
-            "Existing deployment '$deploymentName' did not complete " +
-            "within $($maxAttempts * $delaySeconds) seconds. " +
-            "Last state='$($deployment.ProvisioningState)'."
+            "Deployment '$deploymentName' completed with state " +
+            "'$($deployment.ProvisioningState)'."
         )
     }
-}
-elseif (
-    $null -ne $deployment -and
-    $deployment.ProvisioningState -eq 'Succeeded'
-) {
 
-    Write-Host (
-        "Deployment '$deploymentName' already succeeded. " +
-        "Reusing existing deployment."
-    )
-}
-else {
+    Write-Host ''
+    Write-Host '============================================================'
+    Write-Host 'DAY 2 DEPLOYMENT SUCCEEDED'
+    Write-Host '============================================================'
+    Write-Host "Lab Instance ID : $environmentName"
+    Write-Host "Resource suffix : $skillableSuffix"
+    Write-Host "Deployment      : $deploymentName"
+    Write-Host '============================================================'
 
-    # =================================================================
-    # DEPLOY
-    # =================================================================
+    $deployment |
+        ConvertTo-Json -Depth 30 |
+        Set-Content `
+            -LiteralPath $deploymentResultPath `
+            -Encoding UTF8
 
-    Write-Host "Starting subscription deployment '$deploymentName'..."
-
-    $deployment = New-AzSubscriptionDeployment `
-        -Name $deploymentName `
-        -Location $primaryLocation `
-        -TemplateFile $templateFile `
-        -TemplateParameterObject $templateParameters `
-        -ErrorAction Stop
-}
-
-if ($null -eq $deployment) {
-    throw 'Azure subscription deployment returned no result.'
-}
-
-if ($deployment.ProvisioningState -ne 'Succeeded') {
-    throw (
-        "Deployment '$deploymentName' completed with state " +
-        "'$($deployment.ProvisioningState)'."
-    )
-}
-
-Write-Host ''
-Write-Host '============================================================'
-Write-Host 'DAY 2 DEPLOYMENT SUCCEEDED'
-Write-Host '============================================================'
-Write-Host "Lab Instance ID : $environmentName"
-Write-Host "Resource suffix : $skillableSuffix"
-Write-Host "Deployment      : $deploymentName"
-Write-Host '============================================================'
-
-$deployment |
-    ConvertTo-Json -Depth 30 |
-    Set-Content `
-        -LiteralPath $deploymentResultPath `
-        -Encoding UTF8
-
-Complete-DiagnosticStep
+    Complete-DiagnosticStep
 
     Write-Host ''
     Write-Host '================ DIAGNOSTIC STEP SUMMARY ================'
