@@ -1225,6 +1225,18 @@ param suffix string
                 $deploymentError = $_
                 $combinedError = $deploymentError.Exception.Message
 
+                if (
+                    $null -ne $deploymentError.ErrorDetails -and
+                    -not [string]::IsNullOrWhiteSpace(
+                        [string]$deploymentError.ErrorDetails.Message
+                    )
+                ) {
+                    $combinedError += (
+                        ' ' +
+                        $deploymentError.ErrorDetails.Message
+                    )
+                }
+
                 if ($null -ne $deploymentError.Exception.InnerException) {
                     $combinedError += (
                         ' ' +
@@ -1232,13 +1244,53 @@ param suffix string
                     )
                 }
 
+                # A top-level deployment exception can hide the deepest nested
+                # resource failure. Read failed operations only after failure so
+                # this diagnostic does not delay the normal deployment path.
+                $failedOperationText = ''
+
+                try {
+                    $failedOperations = @(
+                        Get-AzSubscriptionDeploymentOperation `
+                            -DeploymentName $deploymentName `
+                            -ErrorAction Stop |
+                        Where-Object {
+                            $_.ProvisioningState -eq 'Failed'
+                        }
+                    )
+
+                    $failedOperationText = (
+                        $failedOperations |
+                            ForEach-Object {
+                                if ($null -ne $_.StatusMessage) {
+                                    $_.StatusMessage |
+                                        ConvertTo-Json -Depth 50 -Compress
+                                }
+                            }
+                    ) -join ' '
+                }
+                catch {
+                    # A validation failure may not create a deployment record.
+                    # Preserve the original exception when operations are absent.
+                }
+
+                $classificationText = (
+                    $combinedError + ' ' + $failedOperationText
+                )
+
                 $isTransientTransportFailure = (
-                    $combinedError -match 'Connection reset by peer' -or
-                    $combinedError -match 'An error occurred while sending the request' -or
-                    $combinedError -match 'transport connection' -or
-                    $combinedError -match 'The operation has timed out' -or
-                    $combinedError -match 'request was canceled' -or
-                    $combinedError -match 'temporarily unavailable'
+                    $classificationText -match 'Connection reset by peer' -or
+                    $classificationText -match 'An error occurred while sending the request' -or
+                    $classificationText -match 'transport connection' -or
+                    $classificationText -match 'The operation has timed out' -or
+                    $classificationText -match 'request was canceled' -or
+                    $classificationText -match 'temporarily unavailable'
+                )
+
+                $isTransientFrontDoorOriginFailure = (
+                    $classificationText -match '(?i)InternalError' -and
+                    $classificationText -match `
+                        '(?i)Microsoft\.Cdn/profiles/.+/originGroups/.+/origins/'
                 )
 
                 if ($isTransientTransportFailure) {
@@ -1269,6 +1321,50 @@ param suffix string
                         )
 
                         Start-Sleep -Seconds $delaySeconds
+                        continue
+                    }
+
+                    throw
+                }
+
+                if ($isTransientFrontDoorOriginFailure) {
+                    # Azure Front Door occasionally returns InternalError while
+                    # creating the Private Link origin. Most other resources are
+                    # already provisioned, so an idempotent retry of the same
+                    # subscription deployment is the safest recovery path.
+                    $deployment = Get-AzSubscriptionDeployment `
+                        -Name $deploymentName `
+                        -ErrorAction SilentlyContinue
+
+                    if (
+                        $null -ne $deployment -and
+                        $deployment.ProvisioningState -notin @(
+                            'Failed',
+                            'Canceled'
+                        )
+                    ) {
+                        Write-Host (
+                            "Deployment '$deploymentName' remains active after " +
+                            "the Front Door origin error with state " +
+                            "'$($deployment.ProvisioningState)'."
+                        )
+                        break
+                    }
+
+                    if ($deployAttempt -lt $maximumDeployAttempts) {
+                        $frontDoorRetryDelaySeconds = 120
+
+                        Write-Host (
+                            'Transient Azure Front Door origin InternalError ' +
+                            "detected on attempt $deployAttempt."
+                        )
+                        Write-Host (
+                            'Retrying the same idempotent subscription ' +
+                            "deployment in $frontDoorRetryDelaySeconds seconds..."
+                        )
+
+                        $deployment = $null
+                        Start-Sleep -Seconds $frontDoorRetryDelaySeconds
                         continue
                     }
 
