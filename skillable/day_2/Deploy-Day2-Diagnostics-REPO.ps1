@@ -51,8 +51,11 @@ $applicationLocation = 'westus2'
 # Client repository
 # ---------------------------------------------------------------------
 
+$modernizeBootcampCommit =
+    'f0096759be03732662d560e570af7dfa732c47fc'
+
 $repositoryArchiveUrl =
-    'https://codeload.github.com/Azure-Samples/modernize-bootcamp/zip/refs/heads/main'
+    "https://codeload.github.com/Azure-Samples/modernize-bootcamp/zip/$modernizeBootcampCommit"
 
 $customerRelativePath =
     'skillable/day_2/bootcamp_deployment'
@@ -817,8 +820,8 @@ try {
         'source'
 
     Write-Host (
-        'Downloading current ' +
-        'Azure-Samples/modernize-bootcamp main branch...'
+        'Downloading pinned Azure-Samples/modernize-bootcamp commit ' +
+        "'$modernizeBootcampCommit'..."
     )
 
     Invoke-DownloadWithRetry `
